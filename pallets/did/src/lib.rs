@@ -65,8 +65,9 @@ pub use weights::*;
 pub mod pallet {
 	// Import various useful types required by all FRAME pallets.
 	use super::*;
-	use frame_support::pallet_prelude::*;
+	use frame_support::{pallet_prelude::*, traits::Currency};
 	use frame_system::pallet_prelude::*;
+	use sp_std::prelude::*;
 
 	// The `Pallet` struct serves as a placeholder to implement traits, methods and dispatchables
 	// (`Call`s) in this pallet.
@@ -82,6 +83,7 @@ pub mod pallet {
 	pub trait Config: frame_system::Config {
 		/// The overarching runtime event type.
 		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
+		type Currency: Currency<Self::AccountId>;
 		/// A type representing the weights required by the dispatchables of this pallet.
 		type WeightInfo: WeightInfo;
 	}
@@ -93,6 +95,16 @@ pub mod pallet {
 	#[pallet::storage]
 	#[pallet::getter(fn dids)]
 	pub type DIDs<T: Config> = StorageMap<_, Blake2_128Concat, T::AccountId, DIDDocument, OptionQuery>;
+
+	#[pallet::storage]
+	#[pallet::getter(fn credentials)]
+	pub type Credentials<T: Config> = StorageDoubleMap<
+		_,
+		Blake2_128Concat, T::AccountId,
+		Blake2_128Concat, Vec<u8>,
+		VerifiableCredential<T>,
+		OptionQuery
+	>;
 
 	/// Events that functions in this pallet can emit.
 	///
@@ -107,15 +119,11 @@ pub mod pallet {
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
-		/// A user has successfully set a new value.
-		SomethingStored {
-			/// The new value set.
-			something: u32,
-			/// The account who set the new value.
-			who: T::AccountId,
-		},
 		DIDCreated { who: T::AccountId },
-		DIDRetrieved { who: T::AccountId },
+		DIDUpdated { who: T::AccountId },
+		DIDDeleted { who: T::AccountId },
+		CredentialIssued { issuer: T::AccountId, subject: T::AccountId, credential_id: Vec<u8> },
+		CredentialRevoked { issuer: T::AccountId, subject: T::AccountId, credential_id: Vec<u8> },
 	}
 
 	/// Errors that can be returned by this pallet.
@@ -128,11 +136,10 @@ pub mod pallet {
 	/// information.
 	#[pallet::error]
 	pub enum Error<T> {
-		/// The value retrieved was `None` as no value was previously set.
-		NoneValue,
-		/// There was an attempt to increment the value in storage over `u32::MAX`.
-		StorageOverflow,
+		DIDAlreadyExists,
 		DIDNotFound,
+		NotAuthorized,
+		CredentialNotFound,
 	}
 
 	/// The pallet's dispatchable functions ([`Call`]s).
@@ -149,58 +156,92 @@ pub mod pallet {
 	/// The [`weight`] macro is used to assign a weight to each call.
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
-		/// An example dispatchable that takes a single u32 value as a parameter, writes the value
-		/// to storage and emits an event.
-		///
-		/// It checks that the _origin_ for this call is _Signed_ and returns a dispatch
-		/// error if it isn't. Learn more about origins here: <https://docs.substrate.io/build/origins/>
 		#[pallet::call_index(0)]
-		#[pallet::weight(T::WeightInfo::do_something())]
-		pub fn do_something(origin: OriginFor<T>, something: u32) -> DispatchResult {
-			// Check that the extrinsic was signed and get the signer.
+		#[pallet::weight(T::WeightInfo::create_did())]
+		pub fn create_did(
+			origin: OriginFor<T>,
+			public_key: Vec<u8>,
+			service_endpoint: Vec<u8>
+		) -> DispatchResult {
 			let who = ensure_signed(origin)?;
+			ensure!(!DIDs::<T>::contains_key(&who), Error::<T>::DIDAlreadyExists);
 
-			// Update storage.
-			Something::<T>::put(something);
-
-			// Emit an event.
-			Self::deposit_event(Event::SomethingStored { something, who });
-
-			// Return a successful `DispatchResult`
+			let did = DIDDocument {
+				did: who.encode(),
+				public_key,
+				service_endpoint,
+			};
+			DIDs::<T>::insert(&who, did);
+			Self::deposit_event(Event::DIDCreated { who });
 			Ok(())
 		}
 
-		/// An example dispatchable that may throw a custom error.
-		///
-		/// It checks that the caller is a signed origin and reads the current value from the
-		/// `Something` storage item. If a current value exists, it is incremented by 1 and then
-		/// written back to storage.
-		///
-		/// ## Errors
-		///
-		/// The function will return an error under the following conditions:
-		///
-		/// - If no value has been set ([`Error::NoneValue`])
-		/// - If incrementing the value in storage causes an arithmetic overflow
-		///   ([`Error::StorageOverflow`])
 		#[pallet::call_index(1)]
-		#[pallet::weight(T::WeightInfo::cause_error())]
-		pub fn cause_error(origin: OriginFor<T>) -> DispatchResult {
-			let _who = ensure_signed(origin)?;
+		#[pallet::weight(T::WeightInfo::update_did())]
+		pub fn update_did(
+			origin: OriginFor<T>,
+			public_key: Vec<u8>,
+			service_endpoint: Vec<u8>
+		) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+			DIDs::<T>::try_mutate(&who, |did| -> DispatchResult {
+				let did = did.as_mut().ok_or(Error::<T>::DIDNotFound)?;
+				did.public_key = public_key;
+				did.service_endpoint = service_endpoint;
+				Ok(())
+			})?;
+			Self::deposit_event(Event::DIDUpdated { who });
+			Ok(())
+		}
 
-			// Read a value from storage.
-			match Something::<T>::get() {
-				// Return an error if the value has not been set.
-				None => Err(Error::<T>::NoneValue.into()),
-				Some(old) => {
-					// Increment the value read from storage. This will cause an error in the event
-					// of overflow.
-					let new = old.checked_add(1).ok_or(Error::<T>::StorageOverflow)?;
-					// Update the value in storage with the incremented result.
-					Something::<T>::put(new);
-					Ok(())
-				},
-			}
+		#[pallet::call_index(2)]
+		#[pallet::weight(T::WeightInfo::delete_did())]
+		pub fn delete_did(origin: OriginFor<T>) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+			DIDs::<T>::take(&who).ok_or(Error::<T>::DIDNotFound)?;
+			Self::deposit_event(Event::DIDDeleted { who });
+			Ok(())
+		}
+
+		#[pallet::call_index(3)]
+		#[pallet::weight(T::WeightInfo::issue_credential())]
+		pub fn issue_credential(
+			origin: OriginFor<T>,
+			subject: T::AccountId,
+			credential_id: Vec<u8>,
+			credential_type: Vec<u8>,
+			credential_data: Vec<u8>,
+		) -> DispatchResult {
+			let issuer = ensure_signed(origin)?;
+			ensure!(DIDs::<T>::contains_key(&issuer), Error::<T>::DIDNotFound);
+			ensure!(DIDs::<T>::contains_key(&subject), Error::<T>::DIDNotFound);
+
+			let credential = VerifiableCredential {
+				issuer: issuer.clone(),
+				subject: subject.clone(),
+				credential_type,
+				credential_data,
+			};
+			Credentials::<T>::insert(&subject, &credential_id, credential);
+			Self::deposit_event(Event::CredentialIssued { issuer, subject, credential_id });
+			Ok(())
+		}
+
+		#[pallet::call_index(4)]
+		#[pallet::weight(T::WeightInfo::revoke_credential())]
+		pub fn revoke_credential(
+			origin: OriginFor<T>,
+			subject: T::AccountId,
+			credential_id: Vec<u8>,
+		) -> DispatchResult {
+			let issuer = ensure_signed(origin)?;
+			Credentials::<T>::try_mutate_exists(&subject, &credential_id, |credential| -> DispatchResult {
+				let credential = credential.take().ok_or(Error::<T>::CredentialNotFound)?;
+				ensure!(credential.issuer == issuer, Error::<T>::NotAuthorized);
+				Ok(())
+			})?;
+			Self::deposit_event(Event::CredentialRevoked { issuer, subject, credential_id });
+			Ok(())
 		}
 	}
 }
@@ -211,4 +252,21 @@ pub struct DIDDocument {
 	pub did: Vec<u8>,
 	pub public_key: Vec<u8>,
 	pub service_endpoint: Vec<u8>,
+}
+
+#[derive(Clone, Encode, Decode, PartialEq, RuntimeDebug, TypeInfo)]
+#[scale_info(skip_type_params(T))]
+pub struct VerifiableCredential<T: Config> {
+	pub issuer: T::AccountId,
+	pub subject: T::AccountId,
+	pub credential_type: Vec<u8>,
+	pub credential_data: Vec<u8>,
+}
+
+pub trait WeightInfo {
+	fn create_did() -> Weight;
+	fn update_did() -> Weight;
+	fn delete_did() -> Weight;
+	fn issue_credential() -> Weight;
+	fn revoke_credential() -> Weight;
 }
